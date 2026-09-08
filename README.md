@@ -60,6 +60,14 @@ http://localhost:8000/api/v1/
 .\.venv\Scripts\python.exe -m pytest
 ```
 
+For the PostgreSQL-backed concurrency test, run it through Docker:
+
+```powershell
+docker compose exec app python -m pytest tests/test_inventory_api.py -k simultaneous -v
+```
+
+Pytest will show `19 deselected` because `-k simultaneous` runs only the one test whose name matches `simultaneous`; the other collected tests are intentionally filtered out.
+
 ## Environment Variables
 
 See `.env.example`.
