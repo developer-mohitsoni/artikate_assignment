@@ -95,3 +95,5 @@ Important variables:
 ## Screen Recording
 
 Google Drive: https://drive.google.com/file/d/1g81OLqyhpg52wxcv7u6VtpnUUjPjP-Ty/view?usp=sharing
+
+Note: If browser playback is still processing, the file can be downloaded from Google Drive.
