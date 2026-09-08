@@ -106,4 +106,6 @@ Important variables:
 
 Google Drive: https://drive.google.com/file/d/1g81OLqyhpg52wxcv7u6VtpnUUjPjP-Ty/view?usp=sharing
 
+Compressed Version:- https://drive.google.com/file/d/1-K8bdX0uOI6ElpMHdW8IAk1Fp-bBDOqB/view?usp=sharing
+
 Note: If browser playback is still processing, the file can be downloaded from Google Drive.
