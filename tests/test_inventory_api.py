@@ -1,0 +1,186 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from unittest.mock import patch
+
+import pytest
+from django.contrib.auth.models import User
+from django.db import OperationalError, close_old_connections, connection
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from inventory.models import Asset, CheckOut, Employee, OverdueNotice
+from inventory.tasks import flag_overdue_checkouts
+
+
+@pytest.fixture
+def user(db):
+    return User.objects.create_user(username="tester", password="password")
+
+
+@pytest.fixture
+def api_client(user):
+    client = APIClient()
+    client.force_authenticate(user=user)
+    return client
+
+
+def create_asset(tag="AST-001", status=Asset.Status.AVAILABLE):
+    return Asset.objects.create(
+        asset_tag=tag,
+        name=f"Asset {tag}",
+        category=Asset.Category.CAMERA,
+        status=status,
+        purchase_date=timezone.localdate() - timedelta(days=30),
+    )
+
+
+def create_employee(code="EMP001", is_active=True):
+    return Employee.objects.create(
+        employee_code=code,
+        full_name=f"Employee {code}",
+        email=f"{code.lower()}@example.com",
+        is_active=is_active,
+    )
+
+
+def create_checkout(asset, employee, due_at, checked_out_at=None, returned_at=None):
+    checkout = CheckOut.objects.create(
+        asset=asset,
+        employee=employee,
+        due_at=due_at,
+        returned_at=returned_at,
+    )
+    if checked_out_at is not None:
+        CheckOut.objects.filter(pk=checkout.pk).update(checked_out_at=checked_out_at)
+        checkout.refresh_from_db()
+    return checkout
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    connection.vendor == "sqlite",
+    reason="SQLite table-level locks cannot verify the PostgreSQL row-lock concurrency contract.",
+)
+def test_two_simultaneous_checkouts_for_one_asset_allow_exactly_one_success(user):
+    asset = create_asset()
+    employee = create_employee()
+    due_at = (timezone.now() + timedelta(days=1)).isoformat()
+
+    def send_request():
+        close_old_connections()
+        client = APIClient()
+        client.force_authenticate(user=user)
+        try:
+            response = client.post(
+                "/api/v1/checkouts/",
+                {"asset_tag": asset.asset_tag, "employee_code": employee.employee_code, "due_at": due_at},
+                format="json",
+            )
+        except OperationalError:
+            if connection.vendor != "sqlite":
+                raise
+            close_old_connections()
+            return 409
+        close_old_connections()
+        return response.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = list(executor.map(lambda _: send_request(), range(2)))
+
+    assert sorted(statuses) == [201, 409]
+    assert CheckOut.objects.filter(asset=asset, returned_at__isnull=True).count() == 1
+    asset.refresh_from_db()
+    assert asset.status == Asset.Status.CHECKED_OUT
+
+
+@pytest.mark.django_db
+def test_employee_cannot_create_fourth_open_checkout(api_client):
+    employee = create_employee()
+    for index in range(3):
+        asset = create_asset(tag=f"AST-00{index}")
+        create_checkout(asset, employee, timezone.now() + timedelta(days=5))
+
+    fourth_asset = create_asset(tag="AST-004")
+    response = api_client.post(
+        "/api/v1/checkouts/",
+        {
+            "asset_tag": fourth_asset.asset_tag,
+            "employee_code": employee.employee_code,
+            "due_at": (timezone.now() + timedelta(days=5)).isoformat(),
+        },
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert CheckOut.objects.filter(employee=employee, returned_at__isnull=True).count() == 3
+
+
+@pytest.mark.django_db
+def test_overdue_report_excludes_item_due_exactly_now(api_client):
+    fixed_now = timezone.now()
+    employee = create_employee()
+    overdue_asset = create_asset(tag="AST-OVERDUE")
+    exact_asset = create_asset(tag="AST-EXACT")
+    create_checkout(overdue_asset, employee, fixed_now - timedelta(days=2))
+    create_checkout(exact_asset, employee, fixed_now)
+
+    with patch("inventory.views.timezone.now", return_value=fixed_now):
+        response = api_client.get("/api/v1/reports/overdue/")
+
+    assert response.status_code == 200
+    assert response.data["count"] == 1
+    assert response.data["rows"][0]["asset_tag"] == "AST-OVERDUE"
+    assert response.data["rows"][0]["days_overdue"] == 2
+
+
+@pytest.mark.django_db
+def test_employee_summary_returns_database_aggregates(api_client):
+    employee = create_employee()
+    other_employee = create_employee(code="EMP002")
+    now = timezone.now()
+
+    returned_fast_asset = create_asset(tag="AST-FAST")
+    returned_slow_asset = create_asset(tag="AST-SLOW")
+    open_asset = create_asset(tag="AST-OPEN")
+    overdue_asset = create_asset(tag="AST-LATE")
+    other_asset = create_asset(tag="AST-OTHER")
+
+    create_checkout(
+        returned_fast_asset,
+        employee,
+        due_at=now - timedelta(days=4),
+        checked_out_at=now - timedelta(days=5),
+        returned_at=now - timedelta(days=3),
+    )
+    create_checkout(
+        returned_slow_asset,
+        employee,
+        due_at=now - timedelta(days=7),
+        checked_out_at=now - timedelta(days=10),
+        returned_at=now - timedelta(days=4),
+    )
+    create_checkout(open_asset, employee, due_at=now + timedelta(days=2))
+    create_checkout(overdue_asset, employee, due_at=now - timedelta(days=1))
+    create_checkout(other_asset, other_employee, due_at=now - timedelta(days=1))
+
+    response = api_client.get(f"/api/v1/employees/{employee.employee_code}/summary/")
+
+    assert response.status_code == 200
+    assert response.data["lifetime_checkout_count"] == 4
+    assert response.data["currently_held_count"] == 2
+    assert response.data["currently_overdue_count"] == 1
+    assert response.data["mean_hold_duration_days"] == pytest.approx(4.0)
+
+
+@pytest.mark.django_db
+def test_flag_overdue_checkouts_is_idempotent():
+    employee = create_employee()
+    asset = create_asset()
+    checkout = create_checkout(asset, employee, timezone.now() - timedelta(days=1))
+
+    first = flag_overdue_checkouts()
+    second = flag_overdue_checkouts()
+
+    assert first == {"created": 1}
+    assert second == {"created": 0}
+    assert OverdueNotice.objects.filter(checkout=checkout, notice_date=timezone.localdate()).count() == 1
