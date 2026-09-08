@@ -1,24 +1,14 @@
 # Answers
 
-## Part B - Diagnose Broken Snippets
+## Part B - Broken Snippets
 
 ### Snippet 1 - overdue report view
 
-What is wrong:
+The main issue is that the view is doing work in Python that should be done by the database. It loads open check-outs first, then checks whether each one is overdue in application code. That is fine with five rows locally, but it gets expensive once the table grows.
 
-- It loads all open check-outs and filters overdue rows in Python instead of the database.
-- It causes N+1 queries by accessing `c.asset` and `c.employee` inside the loop.
-- It calls `timezone.now()` repeatedly, so rows can be evaluated against slightly different times.
-- Sorting happens in Python instead of SQL.
-- It omits employee code even though the report requirement needs it.
+There is also an N+1 query problem. If the loop touches `c.asset` and `c.employee` without `select_related`, Django may run extra queries for every row. Sorting in Python has the same problem: it works in a small test database but becomes slow and memory-heavy in production. I would also avoid calling `timezone.now()` inside the loop because each row could be compared against a slightly different timestamp.
 
-Why local testing hides it:
-
-- Small local datasets do not show memory, sorting, or N+1 query cost.
-- With only a few rows, repeated `timezone.now()` calls rarely produce visible differences.
-- Local tests often check only response shape, not query count.
-
-Fix:
+A better version pushes filtering and sorting into SQL and fetches the related asset and employee in the same query:
 
 ```python
 from django.utils import timezone
@@ -34,6 +24,7 @@ def overdue_report(request):
         .select_related("asset", "employee")
         .order_by("due_at")
     )
+
     rows = [
         {
             "asset": c.asset.name,
@@ -47,31 +38,15 @@ def overdue_report(request):
     return Response({"count": len(rows), "rows": rows})
 ```
 
-What would catch it:
-
-- Query count tests.
-- Tests with many open non-overdue check-outs.
-- Code review focused on ORM filtering and `select_related`.
+The tests I would want here are a query-count test and a test with enough rows to make sure the endpoint is not filtering most of the data in Python.
 
 ### Snippet 2 - check-out endpoint
 
-What is wrong:
+This code has a correctness issue, not just a cleanup issue. Two requests can read the same asset as available and both create a check-out. That is the kind of bug that manual testing usually misses because manual tests are normally single-request.
 
-- `Asset.objects.get()` and `Employee.objects.get()` can raise 500 instead of returning 404.
-- It does not reject inactive employees.
-- It does not validate `due_at`.
-- It is not atomic: checkout creation can succeed while asset status update fails.
-- It has a race condition. Two requests can both see the asset as available.
-- It checks the employee open-count without locking or enforcing a database-backed transition.
-- It stores `request.data["due_at"]` without serializer validation.
+The endpoint also needs stronger validation. Missing asset or employee records should return `404`, not become an unhandled exception. Inactive employees should be rejected. `due_at` should be validated by a serializer, and the asset update plus check-out creation should happen in a single transaction.
 
-Why local testing hides it:
-
-- Single-user manual testing is not concurrent.
-- Happy-path data always includes valid asset and employee codes.
-- Local tests usually do not simulate database failure between two writes.
-
-Fix:
+The safer shape is:
 
 ```python
 from django.db import transaction
@@ -110,30 +85,13 @@ def check_out_asset(request):
     return Response({"id": checkout.id}, status=201)
 ```
 
-What would catch it:
-
-- Concurrency test with two simultaneous requests for one asset.
-- Tests for inactive employee, unknown asset, unknown employee, and invalid `due_at`.
-- Transaction-focused code review.
+The important part is `transaction.atomic()` plus `select_for_update()` on the asset row. I would test this with two concurrent requests for the same asset, plus normal validation tests for inactive employees, missing records, invalid due dates, and the three-open-checkout limit.
 
 ### Snippet 3 - nightly notice task
 
-What is wrong:
+The risky part is that the task creates notices directly. If the task runs twice, or Celery retries after a partial failure, the same overdue check-out can get duplicate notices unless the database prevents it.
 
-- It blindly creates notices, so retries or repeated runs create duplicates unless the DB rejects them.
-- If email delivery fails after notice creation, retry behavior can create inconsistent duplicate side effects.
-- It passes model instances to Celery, which is fragile and can serialize stale/heavy objects.
-- It calls `timezone.now()` repeatedly.
-- It iterates all overdue rows without batching.
-- It returns `overdue.count()` after iteration, causing another query.
-
-Why local testing hides it:
-
-- Small local overdue sets do not show memory or batching issues.
-- Manual task runs are usually single runs, not retries after partial failure.
-- Eager Celery mode hides serialization and worker process behavior.
-
-Fix:
+For background jobs, I prefer making the database enforce idempotency. In this case that means a unique constraint for one notice per check-out per date, and task code that uses `get_or_create`. I would also pass IDs around instead of model instances, because IDs are safer and cheaper for Celery serialization.
 
 ```python
 from celery import shared_task
@@ -158,29 +116,27 @@ def send_overdue_notices():
             )
         except IntegrityError:
             was_created = False
+
         if was_created:
             deliver_email.delay(checkout_id)
             created += 1
+
     return {"created": created}
 ```
 
-What would catch it:
+The key test is simple: run the task multiple times on the same day and assert that only one notice exists for the same check-out.
 
-- Idempotency test that runs the task twice.
-- Retry simulation after partial failure.
-- Load test or review for `.iterator()` and task argument serialization.
+## Part C - PostgreSQL Query Optimisation
 
-## Part C - Optimise PostgreSQL Query
-
-Original issue:
+The original query is slow mainly because it wraps `checked_out_at` in `DATE(...)`:
 
 ```sql
 WHERE DATE(c.checked_out_at) BETWEEN '2026-01-01' AND '2026-06-30'
 ```
 
-This wraps the indexed column in a function, making a normal btree index on `checked_out_at` less useful. `SELECT *` also returns more data than a reporting screen likely needs.
+That makes it harder for PostgreSQL to use a normal btree index on `checked_out_at`. It also uses `SELECT *`, which usually pulls more columns than a report screen needs.
 
-Rewrite:
+I would rewrite it as a half-open timestamp range:
 
 ```sql
 SELECT c.id, c.asset_id, c.employee_id, c.checked_out_at, c.due_at, c.returned_at
@@ -193,74 +149,64 @@ WHERE c.checked_out_at >= TIMESTAMPTZ '2026-01-01 00:00:00+00'
 ORDER BY c.due_at ASC;
 ```
 
-Changes:
+This keeps the indexed column unwrapped, avoids the end-of-day boundary problem, and makes the join path clearer to the planner.
 
-- Use a half-open timestamp range instead of `DATE(...)`.
-- Use `JOIN` instead of `IN` so the planner has a direct join path.
-- Select only needed columns.
-- Keep `returned_at IS NULL` because the report only needs open check-outs.
-
-Indexes:
+For indexes, I would start with:
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_checkouts_open_checked_out_due
 ON checkouts (checked_out_at, due_at)
 WHERE returned_at IS NULL;
+```
 
+That index is focused on open check-outs, so it should be much smaller than an index over the full table.
+
+I would only add the employee partial index if the data supports it:
+
+```sql
 CREATE INDEX CONCURRENTLY idx_employees_active_id
 ON employees (id)
 WHERE is_active = true;
 ```
 
-The partial checkout index earns its place because the query always filters to open rows. It is smaller than indexing all 4.2M rows and helps the date range plus ordering. The employee partial index may help only if inactive employees are common; if almost everyone is active, it may not be worth keeping because the primary key lookup after joining from filtered checkouts may be enough.
+If almost all employees are active, this second index may not help much. The primary key lookup may already be enough after filtering check-outs.
 
-Expected `EXPLAIN (ANALYZE, BUFFERS)` before:
+Before the rewrite, I would expect `EXPLAIN (ANALYZE, BUFFERS)` to show a sequential scan or a large scan on `checkouts`, with many rows removed by the filter and possibly a large sort. After the rewrite, I would expect an index scan or bitmap index scan using the partial checkout index, fewer buffer reads, and fewer rows filtered after scanning.
 
-- Sequential scan or very large scan on `checkouts`.
-- Filter line showing `date(checked_out_at)` and many rows removed by filter.
-- High shared buffer reads/hits.
-- Sort node over many rows.
-
-Expected after:
-
-- Bitmap index scan or index scan using `idx_checkouts_open_checked_out_due`.
-- Far fewer rows removed by filter.
-- Lower buffer reads.
-- The line proving the fix worked is the scan on `checkouts` using the new partial index.
-
-Growth risk:
-
-- The open-checkout working set and report sort will break first as rows grow.
-- Before that happens, monitor query plans, add pagination/limits for the report, archive old returned rows if needed, and consider partitioning by date only if retention/reporting needs justify it.
-
-Measurement needed:
-
-- Measure selectivity: how many rows have `returned_at IS NULL`, how many fall in the date range, and what percentage of employees are active. Without that, index choice is educated but not certain.
+The main growth risk is the size of the open-checkout working set. If open rows grow a lot, the report and sort will be the first thing to suffer. I would monitor the query plan, paginate reports, archive old returned rows when needed, and only consider partitioning if the data volume and retention rules justify it.
 
 ## Part D - Production Reasoning
 
 ### D1 - Zero-downtime migration
 
-Use multiple deploys. First deploy adds `location_id` as nullable, with the foreign key constraint added in a way that avoids long blocking validation. Old code keeps working because it does not know about the column and the column accepts null. New code can start writing `location_id` for new check-outs while still tolerating null for old rows.
+I would not add `location_id` as a required field in one deploy. On a large table, that can lock the table or break old application instances during rollout.
 
-Then backfill existing rows in small batches outside the request path. Do not run one huge transaction over 4.2 million rows. Track progress and pause if locks or replication lag rise.
+I would do it in phases:
 
-After backfill, deploy code that requires and validates `location_id` for all new writes. Once metrics show no null writes remain, add the final database constraint: validate the FK constraint and set the column non-null. The dangerous mistake is adding a non-null column with a default or validating a large FK in one blocking operation, because it can rewrite or lock the table and block writes.
+1. Add `location_id` as nullable.
+2. Deploy code that can read and write the new column but still works when it is null.
+3. Backfill old rows in small batches outside the request path.
+4. Deploy validation that requires `location_id` for new writes.
+5. After the backfill is complete and metrics show no new nulls, validate the foreign key and make the column non-null.
 
-Rollback: during the nullable phase, old code still works. After the app requires `location_id`, rollback only to code that tolerates both null and non-null until the final non-null constraint is in place.
+The rollback story is also easier this way. During the nullable phase, old code can still run. The dangerous version is a big blocking migration with a non-null default on millions of rows.
 
 ### D2 - Latency triage
 
-First check whether the database is slow or the app is slow: endpoint timing, DB query duration, worker CPU, memory, and connection pool saturation. Then check PostgreSQL activity for blocking locks, long transactions, autovacuum, stale stats, and whether the query plan changed. Next check row counts: open overdue check-outs may have grown sharply. Then check infrastructure: disk IO, CPU steal, network latency, and recent DB maintenance.
+If the overdue report suddenly becomes slow and there has been no deploy for nine days, I would first check whether this is an app problem or a database problem.
 
-Because no deploy happened in nine days, the two most likely causes are data shape change or database health change. Data shape change means many more open overdue rows than before; confirm with counts by due date and returned status. Database health change means stale stats, bloat, lock contention, missing autovacuum, or IO pressure; confirm with `pg_stat_activity`, `pg_stat_user_tables`, `EXPLAIN (ANALYZE, BUFFERS)`, and host metrics.
+The first checks would be endpoint timing, DB query time, CPU, memory, connection pool usage, and slow query logs. On PostgreSQL I would check `pg_stat_activity`, blocking locks, long transactions, autovacuum, stale stats, table bloat, and `EXPLAIN (ANALYZE, BUFFERS)` for the report query.
+
+Since there was no recent deploy, the most likely causes are data shape or database health. Data shape means many more open overdue check-outs than usual. Database health means things like stale statistics, bloat, lock contention, missing autovacuum progress, or IO pressure.
+
+I would avoid guessing from the application code alone. The useful evidence is row counts by `returned_at` and `due_at`, the actual query plan, and database/host metrics around the time latency increased.
 
 ### D3 - CI/CD and safety
 
-On pull requests, run formatting/lint checks, unit tests, API tests, migration checks, and a Docker build. Use a PostgreSQL service in CI so transaction and locking behavior are tested against the real target database.
+For pull requests, I would run formatting/lint checks, unit tests, API tests, migration checks, and a Docker build. Because this assignment depends on transactions and row locks, CI should run against PostgreSQL, not only SQLite.
 
-On merge to main, build and push an immutable Docker image, run the test suite again, and deploy first to staging. Production deploy requires passing tests, successful staging smoke tests, and approval.
+On merge, I would build an immutable Docker image, run the test suite again, deploy to staging, run smoke tests, and only then deploy to production.
 
-For migrations, expand before contract. Backward-compatible migrations run before new code goes live. New code must tolerate both old and new schema during rollout. Destructive or restrictive changes happen in a later deploy after all app instances are updated and data is backfilled.
+For migrations, I would use the expand-before-contract pattern. Add backward-compatible schema first, deploy code that works with both old and new schema, backfill data, and only later add restrictive constraints or remove old fields.
 
-Rollback depends on migration type. If the schema was expanded, rollback code safely. If a restrictive migration has already run, do not blindly roll back to code that cannot handle the new schema. Roll forward with a fix or use a prepared backward-compatible rollback version.
+Rollback depends on the migration phase. If the database was only expanded, rolling back the app is usually safe. If a restrictive migration already ran, I would not blindly roll back to code that cannot handle the new schema; I would roll forward with a fix or use a prepared compatible rollback version.
