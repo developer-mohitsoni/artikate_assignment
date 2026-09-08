@@ -95,6 +95,46 @@ def test_two_simultaneous_checkouts_for_one_asset_allow_exactly_one_success(user
 
 
 @pytest.mark.django_db
+def test_successful_checkout_creates_row_and_marks_asset_checked_out(api_client):
+    asset = create_asset()
+    employee = create_employee()
+
+    response = api_client.post(
+        "/api/v1/checkouts/",
+        {
+            "asset_tag": asset.asset_tag,
+            "employee_code": employee.employee_code,
+            "due_at": (timezone.now() + timedelta(days=5)).isoformat(),
+        },
+        format="json",
+    )
+
+    assert response.status_code == 201
+    assert CheckOut.objects.filter(asset=asset, employee=employee, returned_at__isnull=True).count() == 1
+    asset.refresh_from_db()
+    assert asset.status == Asset.Status.CHECKED_OUT
+
+
+@pytest.mark.django_db
+def test_unavailable_asset_checkout_returns_conflict(api_client):
+    asset = create_asset(status=Asset.Status.MAINTENANCE)
+    employee = create_employee()
+
+    response = api_client.post(
+        "/api/v1/checkouts/",
+        {
+            "asset_tag": asset.asset_tag,
+            "employee_code": employee.employee_code,
+            "due_at": (timezone.now() + timedelta(days=5)).isoformat(),
+        },
+        format="json",
+    )
+
+    assert response.status_code == 409
+    assert CheckOut.objects.count() == 0
+
+
+@pytest.mark.django_db
 def test_employee_cannot_create_fourth_open_checkout(api_client):
     employee = create_employee()
     for index in range(3):
@@ -117,10 +157,46 @@ def test_employee_cannot_create_fourth_open_checkout(api_client):
 
 
 @pytest.mark.django_db
-def test_protected_endpoints_require_authentication():
-    response = APIClient().get("/api/v1/assets/")
+def test_checkout_due_at_must_be_future_and_within_thirty_days(api_client):
+    asset = create_asset()
+    employee = create_employee()
 
-    assert response.status_code == 401
+    past_due = api_client.post(
+        "/api/v1/checkouts/",
+        {
+            "asset_tag": asset.asset_tag,
+            "employee_code": employee.employee_code,
+            "due_at": (timezone.now() - timedelta(minutes=1)).isoformat(),
+        },
+        format="json",
+    )
+    too_far_due = api_client.post(
+        "/api/v1/checkouts/",
+        {
+            "asset_tag": asset.asset_tag,
+            "employee_code": employee.employee_code,
+            "due_at": (timezone.now() + timedelta(days=31)).isoformat(),
+        },
+        format="json",
+    )
+
+    assert past_due.status_code == 400
+    assert too_far_due.status_code == 400
+    assert CheckOut.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_protected_endpoints_require_authentication():
+    client = APIClient()
+    get_assets = client.get("/api/v1/assets/")
+    get_summary = client.get("/api/v1/employees/EMP001/summary/")
+    get_overdue = client.get("/api/v1/reports/overdue/")
+    post_checkout = client.post("/api/v1/checkouts/", {}, format="json")
+
+    assert get_assets.status_code == 401
+    assert get_summary.status_code == 401
+    assert get_overdue.status_code == 401
+    assert post_checkout.status_code == 401
 
 
 @pytest.mark.django_db
@@ -194,6 +270,26 @@ def test_return_endpoint_can_mark_asset_for_maintenance(api_client):
 
 
 @pytest.mark.django_db
+def test_returning_already_returned_checkout_returns_conflict(api_client):
+    asset = create_asset(status=Asset.Status.AVAILABLE)
+    employee = create_employee()
+    checkout = create_checkout(
+        asset,
+        employee,
+        timezone.now() + timedelta(days=5),
+        returned_at=timezone.now(),
+    )
+
+    response = api_client.post(
+        f"/api/v1/checkouts/{checkout.pk}/return/",
+        {"condition_note": "", "needs_maintenance": False},
+        format="json",
+    )
+
+    assert response.status_code == 409
+
+
+@pytest.mark.django_db
 def test_checkout_rolls_back_asset_status_when_checkout_create_fails(api_client):
     asset = create_asset()
     employee = create_employee()
@@ -213,6 +309,63 @@ def test_checkout_rolls_back_asset_status_when_checkout_create_fails(api_client)
     asset.refresh_from_db()
     assert asset.status == Asset.Status.AVAILABLE
     assert CheckOut.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_assets_create_list_filters_search_and_retrieve_current_holder(api_client):
+    camera = create_asset(tag="CAM-FILTER")
+    camera.name = "Alpha Camera Kit"
+    camera.save(update_fields=["name"])
+    laptop = Asset.objects.create(
+        asset_tag="LAP-FILTER",
+        name="Beta Laptop",
+        category=Asset.Category.LAPTOP,
+        status=Asset.Status.AVAILABLE,
+        purchase_date=timezone.localdate(),
+    )
+    employee = create_employee()
+    create_checkout(camera, employee, timezone.now() + timedelta(days=5))
+    camera.status = Asset.Status.CHECKED_OUT
+    camera.save(update_fields=["status"])
+
+    create_response = api_client.post(
+        "/api/v1/assets/",
+        {
+            "asset_tag": "SEN-CREATE",
+            "name": "Created Sensor",
+            "category": Asset.Category.SENSOR,
+            "status": Asset.Status.AVAILABLE,
+            "purchase_date": str(timezone.localdate()),
+        },
+        format="json",
+    )
+    filtered = api_client.get("/api/v1/assets/?status=AVAILABLE&category=LAPTOP")
+    searched = api_client.get("/api/v1/assets/?search=Alpha")
+    retrieved = api_client.get(f"/api/v1/assets/{camera.pk}/")
+
+    assert create_response.status_code == 201
+    assert filtered.status_code == 200
+    assert [row["asset_tag"] for row in filtered.data["results"]] == [laptop.asset_tag]
+    assert searched.status_code == 200
+    assert searched.data["results"][0]["asset_tag"] == camera.asset_tag
+    assert retrieved.status_code == 200
+    assert retrieved.data["current_holder"] == {
+        "employee_code": employee.employee_code,
+        "full_name": employee.full_name,
+    }
+
+
+@pytest.mark.django_db
+def test_asset_list_is_paginated_at_twenty_items(api_client):
+    for index in range(21):
+        create_asset(tag=f"AST-LIST-{index:02d}")
+
+    response = api_client.get("/api/v1/assets/")
+
+    assert response.status_code == 200
+    assert response.data["count"] == 21
+    assert response.data["next"] is not None
+    assert len(response.data["results"]) == 20
 
 
 @pytest.mark.django_db
