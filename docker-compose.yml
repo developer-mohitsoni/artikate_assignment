@@ -1,0 +1,70 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: asset_checkout
+      POSTGRES_USER: asset_checkout
+      POSTGRES_PASSWORD: asset_checkout
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asset_checkout -d asset_checkout"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    command: python manage.py runserver 0.0.0.0:8000
+    environment:
+      DJANGO_SECRET_KEY: dev-compose-secret
+      DJANGO_DEBUG: "True"
+      DB_ENGINE: django.db.backends.postgresql
+      DB_NAME: asset_checkout
+      DB_USER: asset_checkout
+      DB_PASSWORD: asset_checkout
+      DB_HOST: db
+      DB_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - .:/app
+
+  worker:
+    build: .
+    command: celery -A asset_checkout worker -B -l info
+    environment:
+      DJANGO_SECRET_KEY: dev-compose-secret
+      DJANGO_DEBUG: "True"
+      DB_ENGINE: django.db.backends.postgresql
+      DB_NAME: asset_checkout
+      DB_USER: asset_checkout
+      DB_PASSWORD: asset_checkout
+      DB_HOST: db
+      DB_PORT: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - .:/app
+
+volumes:
+  postgres_data:
