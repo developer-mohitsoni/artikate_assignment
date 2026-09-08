@@ -5,6 +5,7 @@ from django.utils import timezone
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -192,6 +193,9 @@ class OverdueReportView(APIView):
             .select_related("asset", "employee")
             .order_by("due_at")
         )
+        paginator = PageNumberPagination()
+        paginator.page_size = 20
+        page = paginator.paginate_queryset(checkouts, request, view=self)
         rows = [
             {
                 "asset_name": checkout.asset.name,
@@ -200,9 +204,10 @@ class OverdueReportView(APIView):
                 "employee_name": checkout.employee.full_name,
                 "days_overdue": (now - checkout.due_at).days,
             }
-            for checkout in checkouts
+            for checkout in page
         ]
-        return Response({"count": len(rows), "rows": OverdueReportRowSerializer(rows, many=True).data})
+        serializer = OverdueReportRowSerializer(rows, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class HealthView(APIView):

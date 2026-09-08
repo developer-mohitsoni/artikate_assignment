@@ -129,8 +129,24 @@ def test_overdue_report_excludes_item_due_exactly_now(api_client):
 
     assert response.status_code == 200
     assert response.data["count"] == 1
-    assert response.data["rows"][0]["asset_tag"] == "AST-OVERDUE"
-    assert response.data["rows"][0]["days_overdue"] == 2
+    assert response.data["results"][0]["asset_tag"] == "AST-OVERDUE"
+    assert response.data["results"][0]["days_overdue"] == 2
+
+
+@pytest.mark.django_db
+def test_overdue_report_is_paginated_at_twenty_items(api_client):
+    employee = create_employee()
+    now = timezone.now()
+    for index in range(21):
+        asset = create_asset(tag=f"AST-PAGE-{index:02d}")
+        create_checkout(asset, employee, now - timedelta(days=index + 1))
+
+    response = api_client.get("/api/v1/reports/overdue/")
+
+    assert response.status_code == 200
+    assert response.data["count"] == 21
+    assert response.data["next"] is not None
+    assert len(response.data["results"]) == 20
 
 
 @pytest.mark.django_db

@@ -46,7 +46,7 @@ services:
 
   worker:
     build: .
-    command: celery -A asset_checkout worker -B -l info
+    command: celery -A asset_checkout worker -B --schedule=/tmp/celerybeat-schedule -l info
     environment:
       DJANGO_SECRET_KEY: dev-compose-secret
       DJANGO_DEBUG: "True"
