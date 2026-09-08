@@ -70,7 +70,9 @@ Pytest will show `19 deselected` because `-k simultaneous` runs only the one tes
 
 ## Environment Variables
 
-See `.env.example`.
+No manual environment setup is required for the default Docker flow; `docker-compose.yml` provides working development values.
+
+For custom local or Docker configuration, see `.env.example`.
 
 Important variables:
 
