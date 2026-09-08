@@ -89,10 +89,9 @@ Important variables:
 
 ## Known Gaps
 
-- The screen recording link is not included yet.
 - This is assignment-grade auth, not a full production authorization model.
 - The overdue task records notices but does not send email because the assignment only requires flagging overdue check-outs.
 
 ## Screen Recording
 
-Add Loom/unlisted recording link here before submission.
+Google Drive: https://drive.google.com/file/d/1g81OLqyhpg52wxcv7u6VtpnUUjPjP-Ty/view?usp=sharing
