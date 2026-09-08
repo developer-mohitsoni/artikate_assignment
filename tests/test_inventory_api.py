@@ -117,6 +117,83 @@ def test_employee_cannot_create_fourth_open_checkout(api_client):
 
 
 @pytest.mark.django_db
+def test_protected_endpoints_require_authentication():
+    response = APIClient().get("/api/v1/assets/")
+
+    assert response.status_code == 401
+
+
+@pytest.mark.django_db
+def test_health_endpoint_does_not_require_authentication():
+    response = APIClient().get("/api/v1/health/")
+
+    assert response.status_code == 200
+    assert response.data == {"database": "ok"}
+
+
+@pytest.mark.django_db
+def test_inactive_employee_checkout_returns_bad_request(api_client):
+    asset = create_asset()
+    employee = create_employee(is_active=False)
+
+    response = api_client.post(
+        "/api/v1/checkouts/",
+        {
+            "asset_tag": asset.asset_tag,
+            "employee_code": employee.employee_code,
+            "due_at": (timezone.now() + timedelta(days=5)).isoformat(),
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400
+    assert CheckOut.objects.count() == 0
+    asset.refresh_from_db()
+    assert asset.status == Asset.Status.AVAILABLE
+
+
+@pytest.mark.django_db
+def test_unknown_asset_or_employee_returns_not_found(api_client):
+    asset = create_asset()
+    employee = create_employee()
+    due_at = (timezone.now() + timedelta(days=5)).isoformat()
+
+    missing_asset = api_client.post(
+        "/api/v1/checkouts/",
+        {"asset_tag": "MISSING", "employee_code": employee.employee_code, "due_at": due_at},
+        format="json",
+    )
+    missing_employee = api_client.post(
+        "/api/v1/checkouts/",
+        {"asset_tag": asset.asset_tag, "employee_code": "MISSING", "due_at": due_at},
+        format="json",
+    )
+
+    assert missing_asset.status_code == 404
+    assert missing_employee.status_code == 404
+
+
+@pytest.mark.django_db
+def test_return_endpoint_can_mark_asset_for_maintenance(api_client):
+    asset = create_asset(status=Asset.Status.CHECKED_OUT)
+    employee = create_employee()
+    checkout = create_checkout(asset, employee, timezone.now() + timedelta(days=5))
+
+    response = api_client.post(
+        f"/api/v1/checkouts/{checkout.pk}/return/",
+        {"condition_note": "Lens cracked.", "needs_maintenance": True},
+        format="json",
+    )
+
+    assert response.status_code == 200
+    checkout.refresh_from_db()
+    asset.refresh_from_db()
+    assert checkout.returned_at is not None
+    assert checkout.condition_note == "Lens cracked."
+    assert asset.status == Asset.Status.MAINTENANCE
+
+
+@pytest.mark.django_db
 def test_checkout_rolls_back_asset_status_when_checkout_create_fails(api_client):
     asset = create_asset()
     employee = create_employee()
