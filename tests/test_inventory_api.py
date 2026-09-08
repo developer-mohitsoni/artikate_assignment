@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 from django.contrib.auth.models import User
 from django.db import OperationalError, close_old_connections, connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -116,6 +117,28 @@ def test_employee_cannot_create_fourth_open_checkout(api_client):
 
 
 @pytest.mark.django_db
+def test_checkout_rolls_back_asset_status_when_checkout_create_fails(api_client):
+    asset = create_asset()
+    employee = create_employee()
+
+    with patch("inventory.views.CheckOut.objects.create", side_effect=RuntimeError("forced failure")):
+        with pytest.raises(RuntimeError, match="forced failure"):
+            api_client.post(
+                "/api/v1/checkouts/",
+                {
+                    "asset_tag": asset.asset_tag,
+                    "employee_code": employee.employee_code,
+                    "due_at": (timezone.now() + timedelta(days=5)).isoformat(),
+                },
+                format="json",
+            )
+
+    asset.refresh_from_db()
+    assert asset.status == Asset.Status.AVAILABLE
+    assert CheckOut.objects.count() == 0
+
+
+@pytest.mark.django_db
 def test_overdue_report_excludes_item_due_exactly_now(api_client):
     fixed_now = timezone.now()
     employee = create_employee()
@@ -131,6 +154,23 @@ def test_overdue_report_excludes_item_due_exactly_now(api_client):
     assert response.data["count"] == 1
     assert response.data["results"][0]["asset_tag"] == "AST-OVERDUE"
     assert response.data["results"][0]["days_overdue"] == 2
+
+
+@pytest.mark.django_db
+def test_overdue_report_does_not_issue_query_per_row(api_client):
+    employee = create_employee()
+    now = timezone.now()
+    for index in range(3):
+        asset = create_asset(tag=f"AST-N1-{index}")
+        create_checkout(asset, employee, now - timedelta(days=index + 1))
+
+    with CaptureQueriesContext(connection) as captured:
+        response = api_client.get("/api/v1/reports/overdue/")
+
+    assert response.status_code == 200
+    assert response.data["count"] == 3
+    assert len(response.data["results"]) == 3
+    assert len(captured) <= 3
 
 
 @pytest.mark.django_db
@@ -186,6 +226,21 @@ def test_employee_summary_returns_database_aggregates(api_client):
     assert response.data["currently_held_count"] == 2
     assert response.data["currently_overdue_count"] == 1
     assert response.data["mean_hold_duration_days"] == pytest.approx(4.0)
+
+
+@pytest.mark.django_db
+def test_employee_summary_handles_no_returned_items(api_client):
+    employee = create_employee()
+    asset = create_asset()
+    create_checkout(asset, employee, timezone.now() + timedelta(days=2))
+
+    response = api_client.get(f"/api/v1/employees/{employee.employee_code}/summary/")
+
+    assert response.status_code == 200
+    assert response.data["lifetime_checkout_count"] == 1
+    assert response.data["currently_held_count"] == 1
+    assert response.data["currently_overdue_count"] == 0
+    assert response.data["mean_hold_duration_days"] is None
 
 
 @pytest.mark.django_db
